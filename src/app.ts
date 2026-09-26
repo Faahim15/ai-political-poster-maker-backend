@@ -7,9 +7,7 @@ const app = express();
 
 app.use(
   cors({
-    origin:
-      process.env.CORS_ORIGIN ??
-      "https://ai-political-poster-maker-37jrjonrl.vercel.app/",
+    origin: process.env.CORS_ORIGIN ?? "http://localhost:3000",
   }),
 );
 app.use(express.json({ limit: "2mb" }));
