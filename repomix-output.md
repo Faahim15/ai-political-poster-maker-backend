@@ -58,6 +58,7 @@ src/
       poster.model.ts
       poster.routes.ts
       poster.service.ts
+      rateLimiter.ts
       render.service.ts
     templates/
       template.controller.ts
@@ -354,14 +355,6 @@ const OCCASION_HINT: Record<Occasion, string> = {
   festival: "ঈদ/উৎসব — উজ্জ্বল, আনন্দময়",
 };
 
-/**
- * Option B: Gemini only suggests the decoration/color scheme.
- * Exact Bangla text is rendered separately via HTML/Puppeteer for accuracy.
- *
- * Uses the Interactions API (generateContent is being phased out
- * for new API keys as of late 2026). Retries on 503/429 since the
- * newly-launched model can hit temporary capacity limits.
- */
 export async function suggestDecoration(
   occasion: Occasion,
 ): Promise<Decoration> {
@@ -379,27 +372,28 @@ Colors must be culturally appropriate for this occasion and have strong contrast
         model: MODEL,
         input: prompt,
       });
-
       const text = (interaction.output_text ?? "").trim();
       const jsonStr = text.replace(/```json|```/g, "").trim();
       const parsed = JSON.parse(jsonStr);
-
       if (parsed.primaryColor && parsed.secondaryColor && parsed.accentColor) {
         return parsed as Decoration;
       }
       return FALLBACK;
     } catch (err: any) {
-      const isRetryable = err?.status === 503 || err?.status === 429;
+      const isRetryable =
+        err?.status === 503 ||
+        err?.status === 429 ||
+        err?.name === "APIConnectionError" ||
+        /unusable|ECONNRESET|ETIMEDOUT/i.test(String(err?.message));
 
       if (isRetryable && attempt < maxRetries) {
-        const waitMs = 3000 * (attempt + 1); // 3s, then 6s
+        const waitMs = 3000 * (attempt + 1);
         console.log(
-          `Gemini busy (${err.status}), retrying in ${waitMs / 1000}s...`,
+          `Gemini busy/network issue, retrying in ${waitMs / 1000}s...`,
         );
         await new Promise((resolve) => setTimeout(resolve, waitMs));
         continue;
       }
-
       console.error(
         "Gemini decoration suggestion failed, using fallback:",
         err,
@@ -407,8 +401,21 @@ Colors must be culturally appropriate for this occasion and have strong contrast
       return FALLBACK;
     }
   }
-
   return FALLBACK;
+}
+
+/**
+ * Picks readable text color ("white" or "dark") for a given background hex color,
+ * using relative luminance. Kept as a plain deterministic function (no Gemini call)
+ * since this needs to run per text zone and the free-tier daily quota is limited.
+ */
+export function suggestTextColor(backgroundHex: string): "white" | "dark" {
+  const hex = backgroundHex.replace("#", "");
+  const r = parseInt(hex.substring(0, 2), 16);
+  const g = parseInt(hex.substring(2, 4), 16);
+  const b = parseInt(hex.substring(4, 6), 16);
+  const luminance = 0.299 * r + 0.587 * g + 0.114 * b;
+  return luminance > 150 ? "dark" : "white";
 }
 ````
 
@@ -570,6 +577,7 @@ export default model<IPoster>("Poster", posterSchema);
 ````typescript
 import { Router } from "express";
 import { requireAuth } from "../../common/middleware/auth.middleware";
+import { generationLimiter } from "./rateLimiter";
 import {
   createPoster,
   getPoster,
@@ -581,10 +589,10 @@ import {
 const router = Router();
 router.use(requireAuth);
 
-router.post("/", createPoster);
+router.post("/", generationLimiter, createPoster);
 router.get("/user/:uid", getUserPosters);
 router.get("/:id", getPoster);
-router.post("/:id/regenerate", regeneratePoster);
+router.post("/:id/regenerate", generationLimiter, regeneratePoster);
 router.delete("/:id", deletePoster);
 
 export default router;
@@ -593,24 +601,25 @@ export default router;
 ## File: src/modules/posters/poster.service.ts
 ````typescript
 import Poster from "./poster.model";
+import Template from "../templates/template.model";
 import { suggestDecoration } from "./gemini.service";
 import { renderPosterPng } from "./render.service";
 import { uploadBuffer } from "../../common/config/cloudinary";
 
-/**
- * Runs the full pipeline for one poster: Gemini decoration -> HTML render -> Cloudinary upload.
- * Called fire-and-forget from the controller; updates the Poster document when done.
- */
 export async function generatePosterAsync(posterId: string): Promise<void> {
   try {
     const poster = await Poster.findById(posterId);
     if (!poster) return;
+
+    const template = await Template.findById(poster.templateId);
+    if (!template) throw new Error(`Template ${poster.templateId} not found`);
 
     const decoration = await suggestDecoration(poster.formData.occasionType);
     const pngBuffer = await renderPosterPng(
       poster.formData,
       poster.uploadedPhotoUrls,
       decoration,
+      template.layoutConfig,
     );
     const { url } = await uploadBuffer(
       pngBuffer,
@@ -629,12 +638,35 @@ export async function generatePosterAsync(posterId: string): Promise<void> {
 }
 ````
 
+## File: src/modules/posters/rateLimiter.ts
+````typescript
+import rateLimit, { ipKeyGenerator } from "express-rate-limit";
+import { Response } from "express";
+import { AuthRequest } from "../../common/middleware/auth.middleware";
+
+export const generationLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: (req) => {
+    const userId = (req as AuthRequest).userId;
+    return userId ?? ipKeyGenerator(req.ip ?? "unknown");
+  },
+  handler: (_req, res: Response) => {
+    res.status(429).json({
+      message: "অনেকবার পোস্টার তৈরির চেষ্টা করেছেন, একটু পর আবার চেষ্টা করুন",
+    });
+  },
+});
+````
+
 ## File: src/modules/posters/render.service.ts
 ````typescript
 import puppeteer from "puppeteer";
 import { IPosterForm } from "./poster.model";
 import { Decoration } from "./gemini.service";
-import type { ITextLayout } from "../templates/template.model";
+import { ILayoutConfig } from "../templates/template.model";
 
 const OCCASION_LABEL: Record<string, string> = {
   victory: "বিজয় দিবস",
@@ -643,8 +675,6 @@ const OCCASION_LABEL: Record<string, string> = {
   greeting: "শুভেচ্ছা",
   festival: "ঈদ/উৎসব",
 };
-const FONT_LINKS = `<link rel="preconnect" href="https://fonts.googleapis.com">
-<link href="https://fonts.googleapis.com/css2?family=Hind+Siliguri:wght@400;600;700&family=Noto+Serif+Bengali:wght@700;800&display=swap" rel="stylesheet">`;
 
 function escapeHtml(s: string): string {
   return s
@@ -653,6 +683,9 @@ function escapeHtml(s: string): string {
     .replace(/>/g, "&gt;")
     .replace(/"/g, "&quot;");
 }
+
+const FONT_LINK = `<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Hind+Siliguri:wght@400;600;700&family=Noto+Serif+Bengali:wght@700;800&display=swap" rel="stylesheet">`;
 
 function buildGradientHtml(
   form: IPosterForm,
@@ -665,92 +698,161 @@ function buildGradientHtml(
         `<div class="photo">${u ? `<img src="${u}" crossorigin="anonymous" />` : ""}</div>`,
     )
     .join("");
+
   const subLine = [form.designation, form.party, form.area]
-    .filter((v): v is string => Boolean(v))
+    .filter((x): x is string => Boolean(x))
     .map(escapeHtml)
     .join(", ");
-  return `<!DOCTYPE html><html lang="bn"><head><meta charset="UTF-8" />${FONT_LINKS}<style>
-  * { margin:0; padding:0; box-sizing:border-box; }
-  body { width:1200px; height:1600px; font-family:'Hind Siliguri',sans-serif; }
-  .poster { position:relative; width:1200px; height:1600px; overflow:hidden; display:flex; flex-direction:column;
-    background: linear-gradient(to bottom, ${decoration.secondaryColor}, ${decoration.primaryColor}); color:white; }
-  .sun { position:absolute; top:-9%; right:-14%; width:52%; aspect-ratio:1; border-radius:50%; background:${decoration.accentColor}; }
-  .photos { position:relative; z-index:1; display:flex; justify-content:center; gap:36px; padding:84px 72px 0; }
-  .photo { width:324px; aspect-ratio:4/5; border-radius:999px 999px 0 0; background:rgba(255,255,255,0.15); border:7px solid rgba(255,255,255,0.85); overflow:hidden; }
-  .photo img { width:100%; height:100%; object-fit:cover; }
-  h1 { position:relative; z-index:1; margin-top:auto; padding:0 72px; text-align:center; font-family:'Noto Serif Bengali',serif;
-    font-weight:800; font-size:108px; line-height:1.15; text-shadow:0 4px 12px rgba(0,0,0,0.35); word-break:break-word; }
-  .footer { position:relative; z-index:1; margin-top:60px; background:white; color:#10231b; text-align:center; padding:36px 60px; }
-  .footer .name { font-size:52px; font-weight:700; line-height:1.2; }
-  .footer .sub { font-size:34px; color:rgba(16,35,27,0.7); margin-top:6px; }
-  .footer .credit { margin-top:14px; font-size:30px; font-weight:600; color:${decoration.primaryColor}; }
-  </style></head><body><div class="poster"><div class="sun"></div><div class="photos">${slots}</div>
-  <h1>${escapeHtml(form.headline)}</h1>
-  <div class="footer"><p class="name">${escapeHtml(form.name)}</p><p class="sub">${subLine || OCCASION_LABEL[form.occasionType]}</p>
-  <p class="credit">প্রচারে: ${escapeHtml(form.name)}</p></div></div></body></html>`;
+
+  return `<!DOCTYPE html>
+<html lang="bn">
+<head>
+<meta charset="UTF-8" />
+${FONT_LINK}
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { width: 1200px; height: 1600px; font-family: 'Hind Siliguri', sans-serif; }
+  .poster {
+    position: relative; width: 1200px; height: 1600px;
+    background: linear-gradient(to bottom, ${decoration.secondaryColor}, ${decoration.primaryColor});
+    color: white; overflow: hidden; display: flex; flex-direction: column;
+  }
+  .sun { position: absolute; top: -9%; right: -14%; width: 52%; aspect-ratio: 1; border-radius: 50%; background: ${decoration.accentColor}; }
+  .photos { position: relative; z-index: 1; display: flex; justify-content: center; gap: 36px; padding: 84px 72px 0; }
+  .photo { width: 324px; aspect-ratio: 4/5; border-radius: 999px 999px 0 0; background: rgba(255,255,255,0.15); border: 7px solid rgba(255,255,255,0.85); overflow: hidden; }
+  .photo img { width: 100%; height: 100%; object-fit: cover; }
+  h1 { position: relative; z-index: 1; margin-top: auto; padding: 0 72px; text-align: center; font-family: 'Noto Serif Bengali', serif; font-weight: 800; font-size: 108px; line-height: 1.15; text-shadow: 0 4px 12px rgba(0,0,0,0.35); word-break: break-word; }
+  .footer { position: relative; z-index: 1; margin-top: 60px; background: white; color: #10231b; text-align: center; padding: 36px 60px; }
+  .footer .name { font-size: 52px; font-weight: 700; line-height: 1.2; }
+  .footer .sub { font-size: 34px; color: rgba(16,35,27,0.7); margin-top: 6px; }
+  .footer .credit { margin-top: 14px; font-size: 30px; font-weight: 600; color: ${decoration.primaryColor}; }
+</style>
+</head>
+<body>
+  <div class="poster">
+    <div class="sun"></div>
+    <div class="photos">${slots}</div>
+    <h1>${escapeHtml(form.headline)}</h1>
+    <div class="footer">
+      <p class="name">${escapeHtml(form.name)}</p>
+      <p class="sub">${subLine || OCCASION_LABEL[form.occasionType]}</p>
+      <p class="credit">প্রচারে: ${escapeHtml(form.name)}</p>
+    </div>
+  </div>
+</body>
+</html>`;
 }
 
-/** Fixed-illustration path: background art + one optional photo dropped into its
- *  blank box + text placed at the template author's configured spots. */
-function buildImageHtml(
+function buildBackgroundImageHtml(
   form: IPosterForm,
-  photoUrl: string | undefined,
-  backgroundImageUrl: string,
-  layout: ITextLayout,
+  photos: string[],
+  layoutConfig: ILayoutConfig,
 ): string {
+  const bg = layoutConfig.backgroundImageUrl!;
+  const slot = layoutConfig.photoSlotPosition ?? {
+    xPct: 35,
+    yPct: 36,
+    widthPct: 30,
+    heightPct: 29,
+    borderRadiusPx: 24,
+  };
+  const headlineYPct = layoutConfig.headlineYPct ?? 76;
+  const headlineColor =
+    layoutConfig.headlineTextColor === "dark" ? "#10231b" : "white";
+  const headlineShadow =
+    layoutConfig.headlineTextColor === "dark"
+      ? "0 2px 6px rgba(255,255,255,0.4)"
+      : "0 4px 14px rgba(0,0,0,0.55)";
+  const photo = photos[0] ?? "";
+  const zones = layoutConfig.textZones;
+  const usesPositionedZones = !!(zones?.name || zones?.sub);
+
   const subLine = [form.designation, form.party, form.area]
-    .filter((v): v is string => Boolean(v))
+    .filter((x): x is string => Boolean(x))
     .map(escapeHtml)
     .join(", ");
-  const p = layout.photo;
 
-  const photoHtml =
-    p && photoUrl
-      ? `<div class="photo-box" style="top:${p.top}%; left:${p.left}%; width:${p.width}%; height:${p.height}%; border-radius:${p.borderRadius}px;">
-           <img src="${photoUrl}" crossorigin="anonymous" />
-         </div>`
-      : "";
+  const nameZoneHtml = zones?.name
+    ? `<div class="zone name-zone" style="top:${zones.name.topPct}%; height:${zones.name.heightPct}%; color:${zones.name.textColor === "dark" ? "#10231b" : "white"};">
+         <p class="name">${escapeHtml(form.name)}</p>
+       </div>`
+    : "";
 
-  return `<!DOCTYPE html><html lang="bn"><head><meta charset="UTF-8" />${FONT_LINKS}<style>
-  * { margin:0; padding:0; box-sizing:border-box; }
-  body { width:1200px; height:1600px; font-family:'Hind Siliguri',sans-serif; }
-  .poster { position:relative; width:1200px; height:1600px; overflow:hidden;
-    background-image:url('${backgroundImageUrl}'); background-size:cover; background-position:center; }
-  .text { position:absolute; left:0; right:0; text-align:center; padding:0 60px; word-break:break-word; }
-  .headline { top:${layout.headline.top}%; font-family:'Noto Serif Bengali',serif; font-weight:800;
-    font-size:${layout.headline.fontSize}px; color:${layout.headline.color}; text-shadow:0 3px 10px rgba(255,255,255,0.5); }
-  .sub { top:${layout.sub.top}%; font-size:${layout.sub.fontSize}px; color:${layout.sub.color}; font-weight:600; }
-  .name { top:${layout.name.top}%; font-size:${layout.name.fontSize}px; color:${layout.name.color}; font-weight:700; }
-  .photo-box { position:absolute; overflow:hidden; box-shadow:0 6px 18px rgba(0,0,0,0.2); }
-  .photo-box img { width:100%; height:100%; object-fit:cover; display:block; }
-  </style></head><body><div class="poster">
-    ${photoHtml}
-    <div class="text headline">${escapeHtml(form.headline)}</div>
-    <div class="text sub">${subLine || OCCASION_LABEL[form.occasionType]}</div>
-    <div class="text name">${escapeHtml(form.name)}</div>
-  </div></body></html>`;
+  const subZoneHtml = zones?.sub
+    ? `<div class="zone sub-zone" style="top:${zones.sub.topPct}%; height:${zones.sub.heightPct}%; color:${zones.sub.textColor === "dark" ? "#10231b" : "white"};">
+         <p class="sub">${subLine || OCCASION_LABEL[form.occasionType]}</p>
+       </div>`
+    : "";
+
+  // No dedicated bars on this template's artwork — use the standard bottom white footer (name+sub+credit).
+  const defaultFooterHtml = !usesPositionedZones
+    ? `<div class="footer">
+         <p class="name">${escapeHtml(form.name)}</p>
+         <p class="sub">${subLine || OCCASION_LABEL[form.occasionType]}</p>
+         <p class="credit">প্রচারে: ${escapeHtml(form.name)}</p>
+       </div>`
+    : "";
+
+  return `<!DOCTYPE html>
+<html lang="bn">
+<head>
+<meta charset="UTF-8" />
+${FONT_LINK}
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { width: 1200px; height: 1600px; font-family: 'Hind Siliguri', sans-serif; }
+  .poster { position: relative; width: 1200px; height: 1600px; overflow: hidden; }
+  .bg { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; }
+  .photo-slot {
+    position: absolute; left: ${slot.xPct}%; top: ${slot.yPct}%; width: ${slot.widthPct}%; height: ${slot.heightPct}%;
+    border-radius: ${slot.borderRadiusPx}px; overflow: hidden; background: #eee; box-shadow: 0 8px 24px rgba(0,0,0,0.25);
+  }
+  .photo-slot img { width: 100%; height: 100%; object-fit: cover; }
+  .headline {
+    position: absolute; top: ${headlineYPct}%; left: 0; right: 0; text-align: center; padding: 0 72px;
+    font-family: 'Noto Serif Bengali', serif; font-weight: 800; font-size: 84px; line-height: 1.15;
+    color: ${headlineColor}; text-shadow: ${headlineShadow}; word-break: break-word;
+  }
+  .zone { position: absolute; left: 0; right: 0; display: flex; align-items: center; justify-content: center; padding: 0 60px; text-align: center; }
+  .zone .name { font-size: 46px; font-weight: 700; line-height: 1.2; }
+  .zone .sub { font-size: 32px; opacity: 0.85; }
+  .footer { position: absolute; left: 0; right: 0; bottom: 0; background: white; color: #10231b; text-align: center; padding: 32px 60px; }
+  .footer .name { font-size: 46px; font-weight: 700; line-height: 1.2; }
+  .footer .sub { font-size: 30px; color: rgba(16,35,27,0.7); margin-top: 4px; }
+  .footer .credit { margin-top: 10px; font-size: 26px; font-weight: 600; color: ${layoutConfig.primaryColor}; }
+</style>
+</head>
+<body>
+  <div class="poster">
+    <img class="bg" src="${bg}" crossorigin="anonymous" />
+    <div class="photo-slot">${photo ? `<img src="${photo}" crossorigin="anonymous" />` : ""}</div>
+    <h1 class="headline">${escapeHtml(form.headline)}</h1>
+    ${nameZoneHtml}
+    ${subZoneHtml}
+    ${defaultFooterHtml}
+  </div>
+</body>
+</html>`;
 }
 
-interface RenderInput {
-  form: IPosterForm;
-  photos: string[];
-  decoration: Decoration;
-  backgroundImageUrl?: string;
-  textLayout?: ITextLayout;
+function buildHtml(
+  form: IPosterForm,
+  photos: string[],
+  decoration: Decoration,
+  layoutConfig: ILayoutConfig,
+): string {
+  if (layoutConfig.backgroundImageUrl)
+    return buildBackgroundImageHtml(form, photos, layoutConfig);
+  return buildGradientHtml(form, photos, decoration);
 }
 
-export async function renderPosterPng({
-  form,
-  photos,
-  decoration,
-  backgroundImageUrl,
-  textLayout,
-}: RenderInput): Promise<Buffer> {
-  const html =
-    backgroundImageUrl && textLayout
-      ? buildImageHtml(form, photos[0], backgroundImageUrl, textLayout)
-      : buildGradientHtml(form, photos, decoration);
-
+export async function renderPosterPng(
+  form: IPosterForm,
+  photos: string[],
+  decoration: Decoration,
+  layoutConfig: ILayoutConfig,
+): Promise<Buffer> {
+  const html = buildHtml(form, photos, decoration, layoutConfig);
   const browser = await puppeteer.launch({
     headless: true,
     args: ["--no-sandbox", "--disable-setuid-sandbox"],
@@ -758,11 +860,9 @@ export async function renderPosterPng({
   try {
     const page = await browser.newPage();
     await page.setViewport({ width: 1200, height: 1600, deviceScaleFactor: 1 });
-    // "load" fires once the HTML, the background image, the photo, and the
-    // font stylesheet have all finished loading — "networkidle0" isn't a
-    // valid waitUntil value for setContent() in Puppeteer 25.x.
     await page.setContent(html, { waitUntil: "load", timeout: 30000 });
-    return (await page.screenshot({ type: "png" })) as Buffer;
+    const buffer = await page.screenshot({ type: "png" });
+    return buffer as Buffer;
   } finally {
     await browser.close();
   }
@@ -785,7 +885,7 @@ export const listTemplates = asyncHandler(
       filter.occasionType = occasion;
     }
     const templates = await Template.find(filter)
-      .select("_id title occasionType thumbnailUrl")
+      .select("_id title occasionType thumbnailUrl layoutConfig")
       .sort({ createdAt: -1 });
     res.json(templates);
   },
@@ -793,7 +893,7 @@ export const listTemplates = asyncHandler(
 
 export const getTemplate = asyncHandler(async (req: Request, res: Response) => {
   const template = await Template.findById(req.params.id).select(
-    "_id title occasionType thumbnailUrl",
+    "_id title occasionType thumbnailUrl layoutConfig",
   );
   if (!template) throw new AppError("টেমপ্লেট পাওয়া যায়নি", 404);
   res.json(template);
@@ -804,33 +904,43 @@ export const getTemplate = asyncHandler(async (req: Request, res: Response) => {
 ````typescript
 import { Schema, model, Document } from "mongoose";
 
-export type Occasion =
-  | "victory"
-  | "condolence"
-  | "campaign"
-  | "greeting"
-  | "festival";
-export const OCCASIONS: Occasion[] = [
-  "victory",
-  "condolence",
-  "campaign",
-  "greeting",
-  "festival",
-];
+export type Occasion = "victory" | "condolence" | "campaign" | "greeting" | "festival";
+export const OCCASIONS: Occasion[] = ["victory", "condolence", "campaign", "greeting", "festival"];
 
-export interface ITextLayout {
-  headline: { top: number; color: string; fontSize: number };
-  name: { top: number; color: string; fontSize: number };
-  sub: { top: number; color: string; fontSize: number };
-  /** NEW: where the user's uploaded photo sits on the background art,
-   *  as percentages of the 1200x1600 canvas — matches the blank box the
-   *  illustration was generated with. */
-  photo?: {
-    top: number;
-    left: number;
-    width: number;
-    height: number;
-    borderRadius: number;
+export interface IPhotoSlotPosition {
+  xPct: number;
+  yPct: number;
+  widthPct: number;
+  heightPct: number;
+  borderRadiusPx: number;
+}
+
+export interface ITextZone {
+  topPct: number;
+  heightPct: number;
+  textColor: "white" | "dark";
+}
+
+export interface ILayoutConfig {
+  primaryColor: string;
+  secondaryColor: string;
+  accentColor: string;
+  photoSlots: number;
+
+  backgroundImageUrl?: string;
+  photoSlotPosition?: IPhotoSlotPosition;
+
+  /** Legacy single headline position (used by templates with no dedicated name/sub bars). */
+  headlineYPct?: number;
+  headlineTextColor?: "white" | "dark";
+
+  /** Positioned name/sub bars for templates whose artwork already has dedicated
+   *  text bars (e.g. campaign, condolence) — when present, these REPLACE the
+   *  default white footer (and the credit line is dropped, since there's no
+   *  room in these designs). */
+  textZones?: {
+    name?: ITextZone;
+    sub?: ITextZone;
   };
 }
 
@@ -838,44 +948,45 @@ export interface ITemplate extends Document {
   title: string;
   occasionType: Occasion;
   thumbnailUrl: string;
-  backgroundImageUrl?: string;
-  textLayout?: ITextLayout;
-  layoutConfig?: {
-    primaryColor: string;
-    secondaryColor: string;
-    accentColor: string;
-    photoSlots: number;
-  };
+  layoutConfig: ILayoutConfig;
   isActive: boolean;
   createdAt: Date;
 }
+
+const textZoneSchema = new Schema<ITextZone>(
+  { topPct: Number, heightPct: Number, textColor: { type: String, enum: ["white", "dark"] } },
+  { _id: false },
+);
+
+const photoSlotPositionSchema = new Schema<IPhotoSlotPosition>(
+  {
+    xPct: Number,
+    yPct: Number,
+    widthPct: Number,
+    heightPct: Number,
+    borderRadiusPx: { type: Number, default: 24 },
+  },
+  { _id: false },
+);
 
 const templateSchema = new Schema<ITemplate>({
   title: { type: String, required: true },
   occasionType: { type: String, enum: OCCASIONS, required: true },
   thumbnailUrl: { type: String, required: true },
-
-  backgroundImageUrl: { type: String },
-  textLayout: {
-    headline: { top: Number, color: String, fontSize: Number },
-    name: { top: Number, color: String, fontSize: Number },
-    sub: { top: Number, color: String, fontSize: Number },
-    photo: {
-      top: Number,
-      left: Number,
-      width: Number,
-      height: Number,
-      borderRadius: Number,
-    },
-  },
-
   layoutConfig: {
     primaryColor: { type: String, default: "#006a4e" },
     secondaryColor: { type: String, default: "#004d39" },
     accentColor: { type: String, default: "#e8383d" },
-    photoSlots: { type: Number, default: 3, min: 0, max: 3 },
+    photoSlots: { type: Number, default: 3, min: 1, max: 3 },
+    backgroundImageUrl: { type: String },
+    photoSlotPosition: { type: photoSlotPositionSchema },
+    headlineYPct: { type: Number },
+    headlineTextColor: { type: String, enum: ["white", "dark"], default: "white" },
+    textZones: {
+      name: { type: textZoneSchema },
+      sub: { type: textZoneSchema },
+    },
   },
-
   isActive: { type: Boolean, default: true },
   createdAt: { type: Date, default: Date.now },
 });
@@ -963,34 +1074,123 @@ const seed = [
   {
     title: "মহান বিজয় দিবস",
     occasionType: "victory" as const,
-    thumbnailUrl: "https://res.cloudinary.com/demo/image/upload/sample.jpg",
+    thumbnailUrl:
+      "https://res.cloudinary.com/byq1o9yf/image/upload/v1790405320/poster-photos/g89zfoqyxdmbmdwxwqhw.jpg",
     layoutConfig: {
       primaryColor: "#006a4e",
       secondaryColor: "#004d39",
       accentColor: "#e8383d",
-      photoSlots: 3,
+      photoSlots: 1,
+      backgroundImageUrl:
+        "https://res.cloudinary.com/byq1o9yf/image/upload/v1790405320/poster-photos/g89zfoqyxdmbmdwxwqhw.jpg",
+      photoSlotPosition: {
+        xPct: 35,
+        yPct: 36,
+        widthPct: 30,
+        heightPct: 29,
+        borderRadiusPx: 24,
+      },
+      headlineYPct: 76,
+      headlineTextColor: "white" as const,
+    },
+  },
+  {
+    title: "শুভেচ্ছা ও শুভকামনা",
+    occasionType: "greeting" as const,
+    thumbnailUrl:
+      "https://res.cloudinary.com/byq1o9yf/image/upload/v1790426674/poster-photos/t67l49eoig8uyjoopadv.jpg",
+    layoutConfig: {
+      primaryColor: "#123056",
+      secondaryColor: "#0d213d",
+      accentColor: "#1e4a7a",
+      photoSlots: 1,
+      backgroundImageUrl:
+        "https://res.cloudinary.com/byq1o9yf/image/upload/v1790426674/poster-photos/t67l49eoig8uyjoopadv.jpg",
+      photoSlotPosition: {
+        xPct: 30,
+        yPct: 45,
+        widthPct: 40,
+        heightPct: 35,
+        borderRadiusPx: 20,
+      },
+      headlineYPct: 28,
+      headlineTextColor: "dark" as const,
+    },
+  },
+  {
+    title: "নির্বাচনী প্রচারণা",
+    occasionType: "campaign" as const,
+    thumbnailUrl:
+      "https://res.cloudinary.com/byq1o9yf/image/upload/v1790427193/poster-photos/xdvqjvtcquuhfble2ptj.jpg",
+    layoutConfig: {
+      primaryColor: "#0b5ea8",
+      secondaryColor: "#08406f",
+      accentColor: "#e8383d",
+      photoSlots: 1, // second (circle) slot in the artwork is a logo/marka spot, not filled by user photo
+      backgroundImageUrl:
+        "https://res.cloudinary.com/byq1o9yf/image/upload/v1790427193/poster-photos/xdvqjvtcquuhfble2ptj.jpg",
+      photoSlotPosition: {
+        xPct: 8,
+        yPct: 15,
+        widthPct: 41,
+        heightPct: 17,
+        borderRadiusPx: 12,
+      },
+      headlineYPct: 67,
+      headlineTextColor: "dark" as const,
+      textZones: {
+        name: { topPct: 79, heightPct: 8, textColor: "dark" as const },
+      },
+    },
+  },
+  {
+    title: "ঈদ মোবারক",
+    occasionType: "festival" as const,
+    thumbnailUrl:
+      "https://res.cloudinary.com/byq1o9yf/image/upload/v1790427238/poster-photos/dmourfo1tolocaxj7gt0.jpg",
+    layoutConfig: {
+      primaryColor: "#b46b35",
+      secondaryColor: "#8a5027",
+      accentColor: "#fabd66",
+      photoSlots: 1,
+      backgroundImageUrl:
+        "https://res.cloudinary.com/byq1o9yf/image/upload/v1790427238/poster-photos/dmourfo1tolocaxj7gt0.jpg",
+      photoSlotPosition: {
+        xPct: 26,
+        yPct: 38,
+        widthPct: 48,
+        heightPct: 24,
+        borderRadiusPx: 30,
+      },
+      headlineYPct: 14,
+      headlineTextColor: "dark" as const,
     },
   },
   {
     title: "গভীর শোক ও শ্রদ্ধা",
     occasionType: "condolence" as const,
-    thumbnailUrl: "https://res.cloudinary.com/demo/image/upload/sample.jpg",
+    thumbnailUrl:
+      "https://res.cloudinary.com/byq1o9yf/image/upload/v1790427271/poster-photos/rnm01ftyvvjdeee38chy.jpg",
     layoutConfig: {
-      primaryColor: "#2b2b2b",
-      secondaryColor: "#101010",
-      accentColor: "#8a8a8a",
+      primaryColor: "#8a8a8a",
+      secondaryColor: "#2b2b2b",
+      accentColor: "#5a5a5a",
       photoSlots: 1,
-    },
-  },
-  {
-    title: "নির্বাচনী প্রচার",
-    occasionType: "campaign" as const,
-    thumbnailUrl: "https://res.cloudinary.com/demo/image/upload/sample.jpg",
-    layoutConfig: {
-      primaryColor: "#0b5ea8",
-      secondaryColor: "#08406f",
-      accentColor: "#e8383d",
-      photoSlots: 2,
+      backgroundImageUrl:
+        "https://res.cloudinary.com/byq1o9yf/image/upload/v1790427271/poster-photos/rnm01ftyvvjdeee38chy.jpg",
+      photoSlotPosition: {
+        xPct: 30.5,
+        yPct: 25,
+        widthPct: 39,
+        heightPct: 39,
+        borderRadiusPx: 20,
+      },
+      headlineYPct: 10,
+      headlineTextColor: "white" as const,
+      textZones: {
+        name: { topPct: 71, heightPct: 16, textColor: "white" as const },
+        sub: { topPct: 88, heightPct: 8, textColor: "white" as const },
+      },
     },
   },
 ];
@@ -1029,26 +1229,6 @@ run().catch((err) => {
   console.error("❌ Test failed:", err);
   process.exit(1);
 });
-````
-
-## File: src/app.ts
-````typescript
-import express from "express";
-import cors from "cors";
-import routes from "./routes";
-import { errorHandler } from "./common/middleware/error.middleware";
-
-const app = express();
-
-app.use(cors({ origin: process.env.CORS_ORIGIN ?? "http://localhost:3000" }));
-app.use(express.json({ limit: "2mb" }));
-
-app.get("/health", (_req, res) => res.json({ ok: true }));
-app.use("/api", routes);
-
-app.use(errorHandler);
-
-export default app;
 ````
 
 ## File: src/routes.ts
@@ -1168,6 +1348,7 @@ run().catch((err) => {
     "cors": "^2.8.5",
     "dotenv": "^16.4.5",
     "express": "^4.21.1",
+    "express-rate-limit": "^8.7.0",
     "jsonwebtoken": "^9.0.2",
     "mongoose": "^8.8.0",
     "multer": "^1.4.5-lts.1",
@@ -1206,4 +1387,30 @@ run().catch((err) => {
   "include": ["src/**/*.ts"],
   "exclude": ["node_modules", "dist"]
 }
+````
+
+## File: src/app.ts
+````typescript
+import express from "express";
+import cors from "cors";
+import routes from "./routes";
+import { errorHandler } from "./common/middleware/error.middleware";
+
+const app = express();
+
+app.use(
+  cors({
+    origin:
+      process.env.CORS_ORIGIN ??
+      "https://ai-political-poster-maker-five.vercel.app/",
+  }),
+);
+app.use(express.json({ limit: "2mb" }));
+
+app.get("/health", (_req, res) => res.json({ ok: true }));
+app.use("/api", routes);
+
+app.use(errorHandler);
+
+export default app;
 ````

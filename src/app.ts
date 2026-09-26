@@ -9,7 +9,7 @@ app.use(
   cors({
     origin:
       process.env.CORS_ORIGIN ??
-      "https://ai-political-poster-maker-five.vercel.app/",
+      "https://ai-political-poster-maker-37jrjonrl.vercel.app/",
   }),
 );
 app.use(express.json({ limit: "2mb" }));
